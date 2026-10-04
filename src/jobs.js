@@ -1,17 +1,20 @@
 const cfg = require('./config');
 const sh = require('./sheets');
 const store = require('./store');
-const { today, nowStr, normPhone, dstr, serialToStr, cleanParam, sleep } = require('./util');
+const wal = require('./wal');
+const { today, nowStr, normPhone, dstr, serialToStr, cleanParam, sleep, sign } = require('./util');
+
+const agentLink = (p) => `${cfg.APP_URL}/?agent=${sign(p)}`;
 
 // ------------------------------ Gupshup ------------------------------
-// params = [body {{1}} = agent name, button URL {{1}} = agent phone]
+// params = [body {{1}} = agent name, button URL {{1}} = agent param (phone, or phone.sig when LINK_SECRET is set)]
 async function gupshupSend(phone, name) {
   const body = new URLSearchParams({
     channel: 'whatsapp',
     source: cfg.GUPSHUP_SOURCE,
     'src.name': cfg.GUPSHUP_APP,
     destination: phone,
-    template: JSON.stringify({ id: cfg.TEMPLATE_ID, params: [cleanParam(name, cfg.NAME_FALLBACK), phone] }),
+    template: JSON.stringify({ id: cfg.TEMPLATE_ID, params: [cleanParam(name, cfg.NAME_FALLBACK), sign(phone)] }),
   });
   try {
     const r = await fetch('https://api.gupshup.io/wa/api/v1/template/msg', {
@@ -32,13 +35,17 @@ async function pool(items, size, fn) {
   await Promise.all(workers);
 }
 
-let blasting = false, blastDay = '';
+// blastDay is kept on the volume, so a restart / redeploy after 9:30 can't blast twice
+let blasting = false;
 async function sendAgentLinks(force = false) {
+  if (!cfg.BLAST_ENABLED) return 'blast disabled (BLAST_ENABLED=0)';
+  if (!cfg.GUPSHUP_API_KEY || !cfg.TEMPLATE_ID) return 'GUPSHUP_API_KEY / TEMPLATE_ID not set';
   if (blasting) return 'blast already running';
-  if (blastDay === today() && !force) return 'already blasted today (add &force=1 to resend)';
+  if (wal.getMeta('blastDay') === today() && !force) return 'already blasted today (add ?force=1 to resend)';
   blasting = true;
   try {
     await store.reload();   // pick up any leads added this morning
+    wal.setMeta('blastDay', today());
     const list = store.agentSummaries().filter((a) => a.remaining > 0 && a.todayCount + a.overdueCount > 0);
     let ok = 0, fail = 0;
     await pool(list, 10, async (a) => {
@@ -46,7 +53,6 @@ async function sendAgentLinks(force = false) {
       if (r.ok) { ok++; store.logClick('LINK_SENT', a.phone, a.name); }
       else { fail++; store.logClick('LINK_FAIL', a.phone, a.name, '', '', r.err); }
     });
-    blastDay = today();
     const msg = `${ok} sent, ${fail} failed (of ${list.length} agents with leads)`;
     console.log('[blast]', msg);
     return msg;
@@ -58,14 +64,14 @@ async function testSend(phoneRaw) {
   if (!p) throw new Error('pass ?phone=98XXXXXXXX');
   const name = store.agentName(p);
   const r = await gupshupSend(p, name);
-  return { to: p, greetedAs: cleanParam(name, cfg.NAME_FALLBACK), appLink: `${cfg.APP_URL}/?agent=${p}`, ...r };
+  return { to: p, greetedAs: cleanParam(name, cfg.NAME_FALLBACK), appLink: agentLink(p), ...r };
 }
 
 // ------------------------------ AgentLinks tab ------------------------------
 async function writeAgentLinks() {
   const rows = store.agentSummaries()
     .filter((a) => a.todayCount + a.overdueCount > 0)
-    .map((a) => ["'" + a.phone, a.name, Math.min(a.remaining, a.todayCount + a.overdueCount), a.overdueCount, `${cfg.APP_URL}/?agent=${a.phone}`]);
+    .map((a) => ["'" + a.phone, a.name, Math.min(a.remaining, a.todayCount + a.overdueCount), a.overdueCount, agentLink(a.phone)]);
   await sh.clear('AgentLinks!A:E');
   await sh.batchWrite([{ range: `AgentLinks!A1:E${rows.length + 1}`, values: [['agent_phone', 'agent_name', 'leads_today', 'overdue_pending', 'link'], ...rows] }]);
   return `${rows.length} agent links written`;
@@ -104,4 +110,4 @@ async function refreshDashboard() {
   return `${rows.length} agents on dashboard`;
 }
 
-module.exports = { sendAgentLinks, testSend, writeAgentLinks, refreshDashboard };
+module.exports = { sendAgentLinks, testSend, writeAgentLinks, refreshDashboard, agentLink };

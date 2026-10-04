@@ -139,9 +139,21 @@ function renderHandoff(waLink, lead) {
 </div><script>setTimeout(function(){location.replace(${safeJson(waLink)})},150)</script>`);
 }
 
+// Same agent tapped a lead they sent a few minutes ago: WhatsApp may not have opened.
+// No auto-open here — the agent must confirm, so an accidental double tap does nothing.
+function renderReopen(waLink, lead, agent) {
+  return page('Already recorded', `<div class="info">
+<div class="icon">✅</div><h3>Already recorded as sent</h3>
+<p>Message to <b>${esc(lead.cxName || 'customer')}</b> (+${esc(lead.cxPhone)}) is already counted.</p>
+<p><b>Only if WhatsApp did not open</b>, or you did not press send, open it again:</p>
+<a class="btn wa" href="${esc(waLink)}">Open WhatsApp again</a>
+<a class="btn disabled" style="pointer-events:auto;margin-top:10px;color:#6b5a55" href="/?agent=${encodeURIComponent(agent)}">Back to my list</a>
+</div>`);
+}
+
 function renderInfo(icon, title, msg, agent) {
-  const back = agent ? `<a class="btn wa" href="/?agent=${esc(agent)}" style="margin-top:14px">Back to my list</a>` : '';
+  const back = agent ? `<a class="btn wa" href="/?agent=${encodeURIComponent(agent)}" style="margin-top:14px">Back to my list</a>` : '';
   return page(title, `<div class="info"><div class="icon">${icon}</div><h3>${esc(title)}</h3><p>${msg}</p>${back}</div>`);
 }
 
-module.exports = { renderApp, renderHandoff, renderInfo, esc };
+module.exports = { renderApp, renderHandoff, renderReopen, renderInfo, esc };

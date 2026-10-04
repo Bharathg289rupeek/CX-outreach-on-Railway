@@ -74,4 +74,20 @@ function info() {
   return { file: FILE, durable, bytes };
 }
 
-module.exports = { load, append, compact, info };
+// Small durable key/value (e.g. the day the agent blast last ran), survives restarts
+function metaFile() { if (!FILE) ensureDir(); return path.join(DIR, 'meta.json'); }
+function getMeta(key) {
+  try { return JSON.parse(fs.readFileSync(metaFile(), 'utf8'))[key]; } catch (e) { return undefined; }
+}
+function setMeta(key, value) {
+  let m = {};
+  try { m = JSON.parse(fs.readFileSync(metaFile(), 'utf8')); } catch (e) {}
+  m[key] = value;
+  try {
+    const tmp = metaFile() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(m));
+    fs.renameSync(tmp, metaFile());
+  } catch (e) { console.error('[wal] meta write failed:', e.message); }
+}
+
+module.exports = { load, append, compact, info, getMeta, setMeta };
