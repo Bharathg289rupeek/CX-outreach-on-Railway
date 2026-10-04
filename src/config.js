@@ -2,14 +2,47 @@ try { require('dotenv').config(); } catch (e) { /* dotenv is optional (local dev
 
 const num = (v, d) => (v === undefined || v === '' ? d : Number(v));
 
-// GOOGLE_SERVICE_ACCOUNT_JSON: the whole key file, as raw JSON or base64 of it
-let creds = {};
-try {
-  let raw = String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
-  if (raw && !raw.startsWith('{')) raw = Buffer.from(raw, 'base64').toString('utf8');
-  creds = raw ? JSON.parse(raw) : {};
-} catch (e) { console.error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON / base64 JSON'); }
+// Real line breaks inside "..." strings (what dashboards often do to the key's \n) → \n escapes
+function escapeNewlinesInStrings(s) {
+  let out = '', inStr = false, esc = false;
+  for (const ch of s) {
+    if (inStr && !esc && (ch === '\n' || ch === '\r')) { if (ch === '\n') out += '\\n'; continue; }
+    out += ch;
+    if (esc) esc = false;
+    else if (ch === '\\') esc = inStr;
+    else if (ch === '"') inStr = !inStr;
+  }
+  return out;
+}
+
+// GOOGLE_SERVICE_ACCOUNT_JSON: the whole key file — raw JSON (as pasted, even if the
+// dashboard mangled line breaks or wrapped it in quotes) or base64 of it.
+// Alternative: GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY as two separate variables.
+function parseCreds(v) {
+  let raw = String(v || '').trim();
+  if (!raw) return {};
+  if (/^'.*'$/s.test(raw)) raw = raw.slice(1, -1).trim();
+  if (!raw.startsWith('{') && !raw.startsWith('"')) raw = Buffer.from(raw, 'base64').toString('utf8').trim();
+  const attempts = [raw, escapeNewlinesInStrings(raw)];
+  for (const a of attempts) {
+    try {
+      let j = JSON.parse(a);
+      if (typeof j === 'string') j = JSON.parse(escapeNewlinesInStrings(j));   // value was JSON-quoted twice
+      if (j && typeof j === 'object') return j;
+    } catch (e) { /* try next */ }
+  }
+  let reason = '';
+  try { JSON.parse(escapeNewlinesInStrings(raw)); } catch (e) { reason = e.message; }
+  console.error(`GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed (${raw.length} chars, starts with ${JSON.stringify(raw.slice(0, 1))}): ${reason}`);
+  return {};
+}
+
+let creds = parseCreds(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+if (!creds.client_email && process.env.GOOGLE_CLIENT_EMAIL && process.env.GOOGLE_PRIVATE_KEY) {
+  creds = { client_email: process.env.GOOGLE_CLIENT_EMAIL.trim(), private_key: process.env.GOOGLE_PRIVATE_KEY.trim().replace(/^"|"$/g, '') };
+}
 if (creds.private_key) creds.private_key = creds.private_key.replace(/\\n/g, '\n');
+if (creds.client_email) console.log('[config] Google service account:', creds.client_email);
 
 module.exports = {
   PORT: num(process.env.PORT, 3000),
