@@ -73,4 +73,7 @@ module.exports = {
   SMTP_USER: process.env.SMTP_USER || '',
   SMTP_PASS: process.env.SMTP_PASS || '',
   MAIL_FROM: process.env.MAIL_FROM || '',
+  // HTTPS mail relay (apps-script/mail-relay.gs) — use when the host blocks SMTP (Railway non-Pro)
+  MAIL_RELAY_URL: (process.env.MAIL_RELAY_URL || '').trim(),
+  MAIL_RELAY_SECRET: process.env.MAIL_RELAY_SECRET || '',
 };
