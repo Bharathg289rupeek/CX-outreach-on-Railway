@@ -1,3 +1,4 @@
+const LOGO = 'data:image/png;base64,' + require('fs').readFileSync(require('path').join(__dirname, '..', 'public', 'logo-sm.png')).toString('base64');
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const safeJson = (o) => JSON.stringify(o).replace(/</g, '\\u003c');
 
@@ -33,7 +34,7 @@ function page(title, body) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title><style>${CSS}</style></head><body>
-<header><img class="logo" src="/logo.png" alt="Rupeek"><div><h2>Rupeek CX Outreach</h2><div class="meta" id="meta">${esc(title)}</div></div></header>
+<header><img class="logo" src="${LOGO}" alt="Rupeek"><div><h2>Rupeek CX Outreach</h2><div class="meta" id="meta">${esc(title)}</div></div></header>
 ${body}</body></html>`;
 }
 
@@ -138,7 +139,7 @@ function renderHandoff(waLink, lead) {
 <div class="icon">📲</div><h3>Opening WhatsApp…</h3>
 <p>Message to <b>${esc(lead.cxName || 'customer')}</b> (+${esc(lead.cxPhone)}) is recorded as sent.</p>
 <a class="btn wa" href="${link}">Tap here if WhatsApp didn't open</a>
-</div><script>setTimeout(function(){location.replace(${safeJson(waLink)})},150)</script>`);
+</div><script>location.replace(${safeJson(waLink)})</script>`);
 }
 
 // Same agent tapped a lead they sent a few minutes ago: WhatsApp may not have opened.

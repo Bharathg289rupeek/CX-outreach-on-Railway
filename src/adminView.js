@@ -4,6 +4,7 @@
  * Send agent links by WhatsApp / email per agent or in bulk, run the blast,
  * and sync / reload / archive the sheet.
  ******************************************************************/
+const LOGO = 'data:image/png;base64,' + require('fs').readFileSync(require('path').join(__dirname, '..', 'public', 'logo-sm.png')).toString('base64');
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 const CSS = `
@@ -62,12 +63,12 @@ dialog .ft{padding:10px 16px;text-align:right;border-top:1px solid var(--line)}
 
 function shell(title, body) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)}</title><link rel="icon" href="/logo.png"><style>${CSS}</style></head><body>${body}</body></html>`;
+<title>${esc(title)}</title><link rel="icon" href="${LOGO}"><style>${CSS}</style></head><body>${body}</body></html>`;
 }
 
 function loginPage(error) {
   return shell('CX Outreach Admin', `
-<header><img src="/logo.png" alt="Rupeek"><div><h1>CX Outreach Admin</h1><div class="sub">Sign in</div></div></header>
+<header><img src="${LOGO}" alt="Rupeek"><div><h1>CX Outreach Admin</h1><div class="sub">Sign in</div></div></header>
 <form class="login" method="post" action="/admin/login">
   <b>Admin token</b>
   <input name="token" type="password" autocomplete="current-password" autofocus required>
@@ -78,7 +79,7 @@ function loginPage(error) {
 
 function dashboardPage() {
   return shell('CX Outreach Admin', `
-<header><img src="/logo.png" alt="Rupeek"><div><h1>CX Outreach Admin</h1><div class="sub" id="sub">Loading…</div></div>
+<header><img src="${LOGO}" alt="Rupeek"><div><h1>CX Outreach Admin</h1><div class="sub" id="sub">Loading…</div></div>
 <div class="sp"></div><a href="/admin/logout">Sign out</a></header>
 <main>
   <div class="strip" id="strip"></div>
