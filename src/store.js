@@ -1,25 +1,25 @@
 /******************************************************************
- * STORE — why this fixes the "same customer messaged twice" problem
+ * STORE — Google Sheet is the database, the Railway process is the gatekeeper.
  *
- * Apps Script version: every tap fired google.script.run.markSent() in the
- * background. Under load that call fails (concurrency limit / LockService
- * timeout / WhatsApp killing the page as it opens), the sheet never says SENT,
- * the lead comes back on the next open, and the customer gets it again.
+ * Why the Apps Script version sent the same customer twice:
+ *   every tap fired google.script.run.markSent(row) in the background. Under load
+ *   that call failed (script-wide lock timeout / WhatsApp killing the page as it
+ *   opens / row numbers shifting after a sort), the sheet never said SENT, the
+ *   lead came back on the next open, and the customer got the message again.
  *
  * Here:
- *  1. All leads live in memory; the Node process is the single source of truth.
- *     A send is claimed synchronously (no await between check and set), so two
- *     taps can never both win — even across devices / agents.
- *  2. The tap itself hits the server (/s/:leadId). The lead is marked SENT
- *     BEFORE WhatsApp is opened, so a killed page can't lose the click.
- *  3. Every click / open / status is written to a log file on the Railway
- *     volume first (wal.js), then synced to the sheet every FLUSH_MS (2 min)
- *     in one batch. Failed syncs stay in the file and retry; a restart
- *     replays the file, so nothing is lost.
- *  4. Leads are addressed by a stable lead_id (column H), not row number,
- *     so sorting / inserting / archiving can't make a write land on the wrong row.
- *  5. Customer-level dedupe: a cx phone already messaged in the last
- *     DEDUPE_DAYS is blocked, even if it's duplicated in the Leads sheet.
+ *  1. All leads are held in memory, loaded from the Leads tab. A send is claimed
+ *     synchronously (no await between check and set), so two taps — same phone,
+ *     two phones, two agents — can never both win.
+ *  2. The tap goes to the server (/s/:id). The lead is marked SENT BEFORE
+ *     WhatsApp opens, so a killed page can't lose the click.
+ *  3. Every status / click is appended to a file on the Railway volume first
+ *     (wal.js), then written to the sheet in one batch every FLUSH_MS. A failed
+ *     write stays in the file and retries; a restart replays the file.
+ *  4. A lead's id is derived from (cx_phone, agent_phone, date), not its row
+ *     number, so sorting / inserting / archiving rows can't misdirect a write.
+ *  5. Customer-level dedupe: a customer messaged by anyone in the last
+ *     DEDUPE_DAYS is hidden from every agent and blocked if tapped.
  *
  * Run exactly ONE Railway replica — state is in memory.
  ******************************************************************/
@@ -30,8 +30,8 @@ const wal = require('./wal');
 const { normPhone, today, nowStr, dstr, isDate, daysBetween } = require('./util');
 
 const LEADS = 'Leads', CLICKS = 'Clicks', ARCHIVE = 'Archive', TPL = 'MsgTemplate';
-const LEAD_HEADER = ['cx_phone', 'cx_name', 'mapped_agent_phone', 'agent_name', 'Date', 'status', 'sent_at', 'lead_id'];
-const CLICK_HEADER = ['timestamp', 'event', 'agent_phone', 'agent_name', 'cx_phone', 'cx_name', 'lead_id'];
+const LEAD_HEADER = ['cx_phone', 'cx_name', 'mapped_agent_phone', 'agent_name', 'Date', 'status', 'sent_at'];
+const CLICK_HEADER = ['timestamp', 'event', 'agent_phone', 'agent_name', 'cx_phone', 'cx_name', 'ref'];
 
 const DEFAULT_TPL =
 `Hi {{cx_name}}, this is {{agent_name}} from Rupeek Gold Loan.
@@ -46,11 +46,12 @@ Lock in today's rate before prices move. WhatsApp me or call me!`;
 
 // ------------------------------ state ------------------------------
 const S = {
-  leads: new Map(),      // lead_id → lead
-  byAgent: new Map(),    // agent phone → [lead_id]
+  leads: new Map(),      // id → lead
+  byAgent: new Map(),    // agent phone → [id]
   agentNames: new Map(), // agent phone → name
   recentCx: new Map(),   // cx phone → last SENT date (yyyy-MM-dd), for dedupe
   sentCount: new Map(),  // agent phone → sends today
+  sentTs: new Map(),     // id → ms of the send (this process only; for the re-open grace window)
   countDay: '',
   template: DEFAULT_TPL,
   ready: false,
@@ -58,7 +59,7 @@ const S = {
   lastFlushAt: null,
   lastFlushError: null,
 };
-const Q = { status: new Map(), clicks: [] };   // write-behind queue
+const Q = { status: new Map(), clicks: [] };   // write-behind queue (mirrored in the WAL file)
 const MAX_QUEUED_CLICKS = 50000;
 
 // Serialize everything that touches the sheet (flush / reload / archive)
@@ -69,7 +70,11 @@ function serial(fn) {
   return p;
 }
 
-const newId = () => crypto.randomBytes(6).toString('hex');
+// Stable id: same customer + agent + date is the same lead, wherever its row is
+function leadId(cx, agent, date) {
+  return crypto.createHash('sha1').update(`${cx}|${agent}|${date}`).digest('hex').slice(0, 16);
+}
+const rowId = (r) => leadId(normPhone(r[0]), normPhone(r[2]), dstr(r[4]) || String(r[4] == null ? '' : r[4]).trim());
 
 function sentToday(agent) {
   const td = today();
@@ -96,27 +101,25 @@ function pruneRecentCx() {
 }
 
 // ------------------------------ loading ------------------------------
+// Everything after the read is synchronous, so no tap can land between
+// "build the new map" and "swap it in" (a tap during the read is covered by Q.status).
 async function loadLeads() {
-  const rows = await sh.read(`${LEADS}!A1:H`);
+  const rows = await sh.read(`${LEADS}!A1:G`);
   const td = today();
-  const header = rows[0] || [];
-  const writes = [];
-  if (String(header[7] || '').trim() !== 'lead_id') {
-    writes.push({ range: `${LEADS}!A1:H1`, values: [LEAD_HEADER] });
-  }
-
   const leads = new Map(), byAgent = new Map(), names = new Map(), counts = new Map();
-  const hcol = [];
-  let idsChanged = false;
 
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i] || [];
-    const empty = r.every((c) => c === '' || c == null);
-    let id = String(r[7] == null ? '' : r[7]).trim();
-    if (empty) { hcol.push([id]); continue; }
-    if (!id || leads.has(id)) { id = newId(); idsChanged = true; }   // missing or copy-pasted duplicate id
-    hcol.push([id]);
+    if (r.every((c) => c === '' || c == null)) continue;
+    const id = rowId(r);
+    const status = String(r[5] == null ? '' : r[5]).trim();
+    const sentAt = dstr(r[6]);
 
+    const dupe = leads.get(id);
+    if (dupe) {                                // same cx+agent+date pasted twice → one lead
+      if (!dupe.status && status) { dupe.status = status; dupe.sentAt = sentAt; }
+      continue;
+    }
     const lead = {
       id,
       cxPhone: normPhone(r[0]),
@@ -124,28 +127,26 @@ async function loadLeads() {
       agentPhone: normPhone(r[2]),
       agentName: String(r[3] == null ? '' : r[3]).trim(),
       date: dstr(r[4]),
-      status: String(r[5] == null ? '' : r[5]).trim(),
-      sentAt: dstr(r[6]),
+      status, sentAt,
     };
-    const q = Q.status.get(id);            // unflushed in-memory change wins over the sheet
-    if (q) { lead.status = q.status; lead.sentAt = dstr(q.sentAt); }
-
     leads.set(id, lead);
     if (!lead.agentPhone) continue;
     if (!byAgent.has(lead.agentPhone)) byAgent.set(lead.agentPhone, []);
     byAgent.get(lead.agentPhone).push(id);
     if (lead.agentName && !names.has(lead.agentPhone)) names.set(lead.agentPhone, lead.agentName);
-
-    if (lead.status === 'SENT') {
-      noteCxSent(lead.cxPhone, lead.sentAt);
-      if (lead.sentAt === td) counts.set(lead.agentPhone, (counts.get(lead.agentPhone) || 0) + 1);
-    }
   }
 
-  if (idsChanged && hcol.length) writes.push({ range: `${LEADS}!H2:H${hcol.length + 1}`, values: hcol });
-  await sh.batchWrite(writes);
+  // unflushed in-memory changes win over the sheet
+  for (const [id, q] of Q.status) {
+    const L = leads.get(id);
+    if (L) { L.status = q.status; L.sentAt = dstr(q.sentAt); }
+  }
+  for (const L of leads.values()) {
+    if (L.status !== 'SENT') continue;
+    noteCxSent(L.cxPhone, L.sentAt);
+    if (L.sentAt === td && L.agentPhone) counts.set(L.agentPhone, (counts.get(L.agentPhone) || 0) + 1);
+  }
 
-  // swap in atomically
   S.leads = leads; S.byAgent = byAgent; S.agentNames = names;
   S.sentCount = counts; S.countDay = td;
   S.loadedAt = new Date();
@@ -158,7 +159,7 @@ async function loadTemplate() {
     const v = await sh.read(`${TPL}!A2`, { valueRenderOption: 'FORMATTED_VALUE' });
     const t = String((v[0] && v[0][0]) || '').trim();
     S.template = t || DEFAULT_TPL;
-  } catch (e) { console.warn('[store] template read failed, keeping previous'); }
+  } catch (e) { console.warn('[store] template read failed, keeping previous:', e.message); }
 }
 
 // Archive history for customer-level dedupe (startup only; archive can be big)
@@ -172,6 +173,10 @@ async function loadArchiveDedupe() {
 }
 
 async function ensureHeaders() {
+  const l = await sh.read(`${LEADS}!A1:G1`);
+  const lh = (l[0] || []).map((x) => String(x || '').trim());
+  if (!lh[0]) await sh.batchWrite([{ range: `${LEADS}!A1:G1`, values: [LEAD_HEADER] }]);
+  else if (lh[5] !== 'status' || lh[6] !== 'sent_at') await sh.batchWrite([{ range: `${LEADS}!F1:G1`, values: [['status', 'sent_at']] }]);
   const c = await sh.read(`${CLICKS}!A1:G1`);
   if (!c.length) await sh.batchWrite([{ range: `${CLICKS}!A1:G1`, values: [CLICK_HEADER] }]);
   const t = await sh.read(`${TPL}!A1:A2`);
@@ -189,16 +194,16 @@ async function init() {
   console.log(`[store] ready — ${n} leads, ${S.byAgent.size} agents, ${S.recentCx.size} recent customers`);
 }
 
-// flush pending writes, then pull the sheet again (picks up newly added leads)
+// pull the sheet again (new leads pasted by ops, template edits)
 function reload() {
   return serial(async () => {
-    const n = await loadLeads();   // pending (unsynced) statuses still override the sheet
+    const n = await loadLeads();
     await loadTemplate();
     return `${n} leads, ${S.byAgent.size} agents`;
   });
 }
 
-// ------------------------------ queue ------------------------------
+// ------------------------------ write-behind ------------------------------
 function logClick(event, agentPhone, agentName, cxPhone = '', cxName = '', ref = '') {
   if (Q.clicks.length >= MAX_QUEUED_CLICKS) Q.clicks.shift();
   const row = [
@@ -227,19 +232,26 @@ async function doFlush() {
   if (!Q.status.size && !Q.clicks.length) return 'nothing to flush';
   const statuses = new Map(Q.status);
   const clicks = Q.clicks.splice(0, Q.clicks.length);
-  let wrote = 0, errors = [];
+  let wrote = 0;
+  const errors = [];
 
   if (statuses.size) {
     try {
-      // fresh id→row map every flush: rows can move (manual sort/insert/archive)
-      const col = await sh.read(`${LEADS}!H1:H`, { valueRenderOption: 'FORMATTED_VALUE' });
-      const rowOf = new Map();
-      col.forEach((r, i) => { const v = String((r && r[0]) || '').trim(); if (v) rowOf.set(v, i + 1); });
+      // fresh id → rows map every flush: rows can move (manual sort / insert / archive)
+      const col = await sh.read(`${LEADS}!A1:E`);
+      const rowsOf = new Map();
+      for (let i = 1; i < col.length; i++) {
+        const r = col[i] || [];
+        if (r.every((c) => c === '' || c == null)) continue;
+        const id = rowId(r);
+        if (!rowsOf.has(id)) rowsOf.set(id, []);
+        rowsOf.get(id).push(i + 1);
+      }
       const data = [];
       for (const [id, v] of statuses) {
-        const row = rowOf.get(id);
-        if (!row) { console.warn('[flush] lead_id not found in sheet, dropping:', id); continue; }
-        data.push({ range: `${LEADS}!F${row}:G${row}`, values: [[v.status, v.sentAt]] });
+        const rows = rowsOf.get(id);
+        if (!rows) { console.warn('[flush] lead no longer in Leads tab, dropping status:', id, v.status); continue; }
+        rows.forEach((row) => data.push({ range: `${LEADS}!F${row}:G${row}`, values: [[v.status, v.sentAt]] }));
       }
       await sh.batchWrite(data);
       for (const [id, v] of statuses) if (Q.status.get(id) === v) Q.status.delete(id);
@@ -252,11 +264,11 @@ async function doFlush() {
     catch (e) { Q.clicks.unshift(...clicks); errors.push('clicks: ' + e.message); }
   }
 
-  wal.compact(Q);   // drop what reached the sheet, keep what didn't
+  wal.compact(Q);   // keep only what didn't reach the sheet
   S.lastFlushAt = new Date();
   S.lastFlushError = errors.length ? errors.join(' | ') : null;
   if (errors.length) console.error('[flush] will retry —', S.lastFlushError);
-  return `${wrote} statuses, ${errors.length ? 0 : clicks.length} clicks written`;
+  return `${wrote} status cells, ${errors.some((e) => e.startsWith('clicks')) ? 0 : clicks.length} clicks written`;
 }
 
 // ------------------------------ reads for UI ------------------------------
@@ -302,20 +314,26 @@ function markSend(agent, id) {
   if (!L || !agent || L.agentPhone !== agent) return { code: 'not_found' };
 
   if (L.status === 'SENT') {
-    logClick('REPEAT_BLOCKED', agent, '', L.cxPhone, L.cxName, id);
-    return { code: 'already', lead: L };
+    // Same agent, within a few minutes: WhatsApp may simply not have opened — let them
+    // re-open the chat (they still have to press send in WhatsApp themselves).
+    const ts = S.sentTs.get(id);
+    const reopen = !!ts && Date.now() - ts < cfg.REOPEN_MIN * 60000;
+    logClick(reopen ? 'REOPEN' : 'REPEAT_BLOCKED', agent, '', L.cxPhone, L.cxName, id);
+    return { code: reopen ? 'reopen' : 'already', lead: L, waLink: reopen ? waLink(L) : '' };
   }
   if (L.status) return { code: 'closed', lead: L };
 
   if (isRecentCx(L.cxPhone)) {
+    const lastSent = S.recentCx.get(L.cxPhone);
     setStatus(L, 'DUPLICATE');
     logClick('DUP_BLOCKED', agent, '', L.cxPhone, L.cxName, id);
-    return { code: 'dup', lead: L, lastSent: S.recentCx.get(L.cxPhone) };
+    return { code: 'dup', lead: L, lastSent };
   }
 
   if (sentToday(agent) >= cfg.DAILY_CAP) return { code: 'capped', lead: L };
 
   setStatus(L, 'SENT');
+  S.sentTs.set(id, Date.now());
   S.sentCount.set(agent, sentToday(agent) + 1);
   noteCxSent(L.cxPhone, today());
   logClick('SEND_CLICK', agent, '', L.cxPhone, L.cxName, id);
@@ -323,20 +341,23 @@ function markSend(agent, id) {
 }
 
 // ------------------------------ archive ------------------------------
-// Moves SENT/DUPLICATE rows finished before today to Archive. Because rows are
-// addressed by lead_id, this no longer corrupts writes if an agent is mid-session.
+// Moves SENT/DUPLICATE rows finished before today to Archive. Rows are addressed
+// by id, so this is safe even if an agent is mid-session.
 function archive() {
   return serial(async () => {
     await doFlush();
     const td = today();
-    const raw = await sh.read(`${LEADS}!A1:H`);                                        // for decisions
-    const fmt = await sh.read(`${LEADS}!A1:H`, { valueRenderOption: 'FORMATTED_VALUE' }); // for rewriting as-displayed
+    const raw = await sh.read(`${LEADS}!A1:Z`);                                          // for decisions
+    const fmt = await sh.read(`${LEADS}!A1:Z`, { valueRenderOption: 'FORMATTED_VALUE' });  // rewritten as displayed
     if (raw.length < 2) return '0 rows archived';
     if (raw.length !== fmt.length) throw new Error('Leads changed during archive — retry');
 
-    const width = LEAD_HEADER.length;
+    const width = Math.max(LEAD_HEADER.length, ...fmt.map((r) => (r || []).length));
+    const col = (n) => { let s = ''; for (n++; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s; return s; };
+    const last = col(width - 1);
     const padRow = (r) => { const x = (r || []).slice(0, width); while (x.length < width) x.push(''); return x; };
-    const keep = [LEAD_HEADER], move = [];
+
+    const keep = [padRow(fmt[0])], move = [];
     for (let i = 1; i < raw.length; i++) {
       const r = raw[i] || [];
       if (r.every((c) => c === '' || c == null)) continue;   // compact blank rows
@@ -347,11 +368,11 @@ function archive() {
     }
     if (!move.length) return '0 rows archived';
 
-    const ah = await sh.read(`${ARCHIVE}!A1:H1`);
-    if (!ah.length) await sh.batchWrite([{ range: `${ARCHIVE}!A1:H1`, values: [LEAD_HEADER] }]);
-    await sh.append(`${ARCHIVE}!A:H`, move);                                             // 1) copy out
-    await sh.batchWrite([{ range: `${LEADS}!A1:H${keep.length}`, values: keep }]);        // 2) overwrite top
-    await sh.clear(`${LEADS}!A${keep.length + 1}:H`);                                    // 3) clear the tail
+    const ah = await sh.read(`${ARCHIVE}!A1:A1`);
+    if (!ah.length) await sh.batchWrite([{ range: `${ARCHIVE}!A1:${last}1`, values: [keep[0]] }]);
+    await sh.append(`${ARCHIVE}!A:${last}`, move);                                           // 1) copy out
+    await sh.batchWrite([{ range: `${LEADS}!A1:${last}${keep.length}`, values: keep }]);     // 2) overwrite top
+    await sh.clear(`${LEADS}!A${keep.length + 1}:${last}`);                                  // 3) clear the tail
     await loadLeads();
     return `${move.length} rows archived, ${keep.length - 1} remain in Leads`;
   });
@@ -369,4 +390,5 @@ function stats() {
 module.exports = {
   init, reload, flush, archive, buildQueue, agentSummaries, markSend, logClick, stats,
   ready: () => S.ready, agentName: (p) => S.agentNames.get(p) || '',
+  _leadId: leadId,
 };

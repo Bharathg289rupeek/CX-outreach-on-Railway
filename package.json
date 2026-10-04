@@ -1,17 +1,17 @@
 {
   "name": "rupeek-cx-outreach",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "Agent WhatsApp outreach app — Postgres for live state, Google Sheet for leads + reports",
+  "description": "Agent WhatsApp outreach app — Railway in front, Google Sheet as the database",
   "main": "src/server.js",
   "engines": { "node": ">=20" },
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node test/store.test.js"
   },
   "dependencies": {
     "express": "^4.21.2",
     "googleapis": "^144.0.0",
-    "node-cron": "^3.0.3",
-    "pg": "^8.13.1"
+    "node-cron": "^3.0.3"
   }
 }
