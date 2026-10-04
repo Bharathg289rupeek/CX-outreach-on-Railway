@@ -15,7 +15,9 @@ const cron = require('node-cron');
 const cfg = require('./config');
 const store = require('./store');
 const jobs = require('./jobs');
+const crypto = require('crypto');
 const views = require('./views');
+const adminView = require('./adminView');
 const { verifyAgent, normPhone } = require('./util');
 
 const app = express();
@@ -81,12 +83,46 @@ app.get('/health', (req, res) => {
 });
 
 // ------------------------------ admin ------------------------------
-// curl -X POST "https://<app>/admin/flush" -H "x-admin-token: $ADMIN_TOKEN"
+// Browser: /admin → sign in with ADMIN_TOKEN → HttpOnly session cookie.
+// Scripts: curl -X POST "https://<app>/admin/flush" -H "x-admin-token: $ADMIN_TOKEN"
+const COOKIE = 'cxo_admin';
+const sessionValue = () => crypto.createHmac('sha256', cfg.ADMIN_TOKEN).update('admin-session-v1').digest('hex');
+const same = (a, b) => { const x = Buffer.from(String(a || '')), y = Buffer.from(String(b || '')); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+function cookie(req, name) {
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return '';
+}
+const isAdmin = (req) => !!cfg.ADMIN_TOKEN &&
+  (same(req.get('x-admin-token') || req.query.token, cfg.ADMIN_TOKEN) || same(cookie(req, COOKIE), sessionValue()));
 function admin(req, res, next) {
-  const t = req.get('x-admin-token') || req.query.token;
-  if (!cfg.ADMIN_TOKEN || t !== cfg.ADMIN_TOKEN) return res.status(401).send('unauthorized');
+  if (!isAdmin(req)) return res.status(401).send('unauthorized');
   next();
 }
+
+app.get('/admin', (req, res) => {
+  if (!cfg.ADMIN_TOKEN) return res.status(503).send(adminView.loginPage('ADMIN_TOKEN is not set in Railway variables.'));
+  res.send(isAdmin(req) ? adminView.dashboardPage() : adminView.loginPage());
+});
+let loginFails = 0, loginLockUntil = 0;   // slow down token guessing
+app.post('/admin/login', express.urlencoded({ extended: false }), (req, res) => {
+  if (Date.now() < loginLockUntil) return res.status(429).send(adminView.loginPage('Too many attempts. Wait a minute.'));
+  if (!cfg.ADMIN_TOKEN || !same(String((req.body && req.body.token) || '').trim(), cfg.ADMIN_TOKEN)) {
+    if (++loginFails >= 5) { loginFails = 0; loginLockUntil = Date.now() + 60000; }
+    return res.status(401).send(adminView.loginPage('Wrong token.'));
+  }
+  loginFails = 0;
+  const secure = req.secure || req.get('x-forwarded-proto') === 'https' ? '; Secure' : '';
+  res.set('Set-Cookie', `${COOKIE}=${sessionValue()}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=${7 * 86400}${secure}`);
+  res.redirect(303, '/admin');
+});
+app.get('/admin/logout', (req, res) => {
+  res.set('Set-Cookie', `${COOKIE}=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0`);
+  res.redirect(303, '/admin');
+});
+
 const run = (fn) => async (req, res) => {
   try {
     const out = await fn(req);
@@ -94,6 +130,18 @@ const run = (fn) => async (req, res) => {
   } catch (e) { res.status(500).type('text').send('ERROR: ' + e.message); }
 };
 app.get('/admin/stats',     admin, run(() => store.stats()));
+app.get('/admin/api/overview', admin, (req, res) => {
+  if (!store.ready()) return res.status(503).json({ error: 'starting' });
+  res.json(jobs.overview());
+});
+app.post('/admin/api/send', admin, express.json({ limit: '200kb' }), run((req) => {
+  const b = req.body || {};
+  if (!Array.isArray(b.phones) || !b.phones.length) throw new Error('no agents selected');
+  if (b.phones.length > 2000) throw new Error('too many agents in one request');
+  const ch = String(b.channel || '').toLowerCase();
+  if (ch && !['whatsapp', 'email', 'both'].includes(ch)) throw new Error('bad channel');
+  return jobs.sendLinks(b.phones, { channel: ch, email: String(b.email || '').trim() });
+}));
 app.post('/admin/flush',    admin, run(() => store.flush()));
 app.post('/admin/reload',   admin, run(() => store.reload()));
 const reportsJob = async () => `${await store.syncAgentsTab()} · ${await jobs.refreshDashboard()} · ${await jobs.writeAgentLinks()}`;
