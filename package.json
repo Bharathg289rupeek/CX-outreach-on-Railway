@@ -4,14 +4,17 @@
   "private": true,
   "description": "Agent WhatsApp outreach app — Railway in front, Google Sheet as the database",
   "main": "src/server.js",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/store.test.js"
+    "test": "node test/store.test.js && node test/links.test.js"
   },
   "dependencies": {
     "express": "^4.21.2",
     "googleapis": "^144.0.0",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.10.1"
   }
 }

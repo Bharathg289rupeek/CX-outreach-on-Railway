@@ -65,4 +65,12 @@ module.exports = {
   TEMPLATE_ID: process.env.TEMPLATE_ID || '',
   NAME_FALLBACK: process.env.NAME_FALLBACK || 'there',
   BLAST_ENABLED: process.env.BLAST_ENABLED !== '0',
+
+  // How agents get their daily link when the Agents tab doesn't say: WHATSAPP | EMAIL | BOTH | NONE
+  DEFAULT_CHANNEL: String(process.env.DEFAULT_CHANNEL || 'WHATSAPP').toUpperCase(),
+  SMTP_HOST: process.env.SMTP_HOST || '',
+  SMTP_PORT: num(process.env.SMTP_PORT, 587),
+  SMTP_USER: process.env.SMTP_USER || '',
+  SMTP_PASS: process.env.SMTP_PASS || '',
+  MAIL_FROM: process.env.MAIL_FROM || '',
 };

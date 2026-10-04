@@ -29,7 +29,26 @@ Agent taps ──► Railway /s/:id ──► claim in memory + write to Railway
 * **Daily cap** (`DAILY_CAP`, default 10) is enforced on the server.
 * **WhatsApp didn't open?** The same agent can tap the lead again within `REOPEN_MIN` (15 min) and gets an "Already recorded — open WhatsApp again" page. It still counts once.
 
-The sheet stays the ops interface: paste leads in `Leads` (columns A–E as before), edit the message in `MsgTemplate!A2`. Railway fills `status`/`sent_at`, `Clicks`, `Dashboard`, `AgentLinks`.
+The sheet stays the ops interface: paste leads in `Leads` (columns A–E as before), edit the message in `MsgTemplate!A2`, and choose how each agent gets their link in `Agents`. Railway fills `status`/`sent_at`, `Clicks`, `Dashboard`, `AgentLinks`.
+
+## Agent links: WhatsApp or email
+
+The `Agents` tab decides how each agent gets their daily link. Railway adds every agent it sees in `Leads` there automatically, so ops only fill columns C and D:
+
+| A agent_phone | B agent_name | C email | D link_channel |
+|---|---|---|---|
+| 9000000001 | Ravi | | WHATSAPP |
+| 9000000002 | Sita | sita@rupeek.com | EMAIL |
+| 9000000003 | Gopal | gopal@rupeek.com | BOTH |
+| 9000000004 | Meena | | NONE |
+
+* A blank channel uses `DEFAULT_CHANNEL` (WhatsApp unless changed).
+* `EMAIL` with no address falls back to WhatsApp, so the agent still gets the link.
+* Edits are picked up within 5 minutes, and always right before the 9:30 send.
+* The email has the same content as the old Apps Script email (target, today's leads, overdue, button), so `Emaillink` and that script can be retired.
+* `Dashboard` → `link_sent_today` shows `WhatsApp`, `Email`, `WhatsApp + Email`, `FAILED` or `No`. Failures carry the reason in `Clicks` (`LINK_FAIL`, column G).
+
+**Email setup:** set `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` in Railway. For Google Workspace: turn on 2-step verification for the sending mailbox, create an **App Password** (Google Account → Security → App passwords), and use `smtp.gmail.com` / `587`. If Rupeek IT blocks App Passwords, any SMTP provider (SendGrid, AWS SES) works with the same variables.
 
 > Run **exactly one** Railway replica. State lives in that one process.
 
@@ -61,7 +80,7 @@ Open the `AgentLinks` tab (filled within a minute), open one link on your phone,
 ### 4. Cutover from Apps Script
 1. In the old Apps Script project, paste `apps-script/bridge.gs` over the old code, set `RAILWAY_URL`, then **Deploy → Manage deployments → edit the existing deployment → New version**. This keeps the `/exec` URL the approved Gupshup template points to, so agents' buttons keep working.
 2. Run `removeOldTriggers()` once. **Important** — otherwise both systems blast agents and write to the sheet.
-3. Email script: no code change. It reads `Emaillink!F`; make sure that column pulls from `AgentLinks!E` (now Railway links).
+3. Email: Railway now sends link emails itself. Copy agent emails from `Emaillink` into the `Agents` tab (column C, channel `EMAIL` or `BOTH`), set the SMTP variables, then delete the old email script's 9 AM / 1 PM triggers so agents don't get two emails.
 4. Later: get a new Gupshup template whose button points straight at `APP_URL/?agent={{1}}`, update `TEMPLATE_ID`, and the bridge is no longer needed. Set `LINK_SECRET` (and later `REQUIRE_SIGNED_LINKS=true`) so nobody can open another agent's list by editing the number in the URL.
 
 ## Schedule (IST, in-process)
@@ -71,7 +90,7 @@ Open the `AgentLinks` tab (filled within a minute), open one link on your phone,
 | every 5 min | reload `Leads` + `MsgTemplate` from the sheet |
 | every 10 min | rewrite `Dashboard` + `AgentLinks` |
 | 03:00 | move SENT / DUPLICATE rows from before today to `Archive` |
-| 09:30 | Gupshup blast to agents with leads (once per day, remembered on the volume) |
+| 09:30 | agent-link blast by WhatsApp and/or email per the `Agents` tab (once per day, remembered on the volume) |
 
 ## Admin (header `x-admin-token: $ADMIN_TOKEN`)
 | Endpoint | Does |
@@ -82,7 +101,9 @@ Open the `AgentLinks` tab (filled within a minute), open one link on your phone,
 | `POST /admin/reports` | rewrite Dashboard + AgentLinks now |
 | `POST /admin/archive` | archive now |
 | `POST /admin/blast` | run today's blast (`?force=1` to resend) |
-| `POST /admin/test-send?phone=98XXXXXXXX` | send the template to one number |
+| `POST /admin/send-link?phone=98XXXXXXXX` | send one agent their link now, per their `Agents` channel |
+| `…&channel=whatsapp\|email\|both` | override the channel |
+| `…&channel=email&email=me@rupeek.com` | send that agent's link to a test address |
 
 ## Ops notes
 * New leads appear in the app within `RELOAD_MIN` (5 min), or immediately after `POST /admin/reload`.
@@ -94,4 +115,4 @@ Open the `AgentLinks` tab (filled within a minute), open one link on your phone,
 ```bash
 npm test
 ```
-Runs the store against an in-memory fake sheet: 20 simultaneous taps, cross-agent dedupe, cap, sorting rows before a flush, a tap during reload, sheet outage + restart, archive.
+Runs the store against an in-memory fake sheet (20 simultaneous taps, cross-agent dedupe, cap, sorting rows before a flush, a tap during reload, sheet outage + restart, archive) and the link blast per channel with Gupshup and SMTP stubbed.
