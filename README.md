@@ -92,7 +92,19 @@ Open the `AgentLinks` tab (filled within a minute), open one link on your phone,
 | 03:00 | move SENT / DUPLICATE rows from before today to `Archive` |
 | 09:30 | agent-link blast by WhatsApp and/or email per the `Agents` tab (once per day, remembered on the volume) |
 
-## Admin (header `x-admin-token: $ADMIN_TOKEN`)
+## Admin dashboard — `https://<your-app>/admin`
+
+Sign in with `ADMIN_TOKEN` (stays signed in for 7 days on that browser). It shows:
+* **Status:** WhatsApp / email configured, whether today's 9:30 blast ran, last sheet sync (and any error), changes waiting for the sheet, volume OK.
+* **Today's numbers:** agents with leads, leads today / overdue, messages sent vs capacity, sent this month, links delivered (and failures), agents who opened the app.
+* **Every agent:** link channel + email, today / overdue / sent / month, whether today's link went out (WhatsApp, Email, FAILED with the reason on hover), opens, last activity.
+* **Send links:** per agent (**WhatsApp**, **Email**, or **Copy link**), or tick several agents and send by their Agents-tab channel / WhatsApp / Email / both. Email for an agent with no address asks for one. Results show per agent.
+* **Buttons:** send today's links to everyone (or resend), sync to sheet, reload sheet, refresh the Dashboard/AgentLinks tabs, archive.
+* **Filters:** link not sent, link failed, link sent but not opened, daily limit reached, has email.
+
+Everything shown comes from memory, so the page loads instantly and doesn't use Sheets quota. Email and channel are still edited in the `Agents` tab.
+
+## Admin API (header `x-admin-token: $ADMIN_TOKEN`)
 | Endpoint | Does |
 |---|---|
 | `GET /admin/stats` | queue sizes, last flush / error, volume file |

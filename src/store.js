@@ -27,7 +27,7 @@ const crypto = require('crypto');
 const cfg = require('./config');
 const sh = require('./sheets');
 const wal = require('./wal');
-const { normPhone, today, nowStr, dstr, isDate, daysBetween } = require('./util');
+const { normPhone, today, nowStr, dstr, isDate, daysBetween, serialToStr } = require('./util');
 
 const LEADS = 'Leads', CLICKS = 'Clicks', ARCHIVE = 'Archive', TPL = 'MsgTemplate', AGENTS = 'Agents';
 const LEAD_HEADER = ['cx_phone', 'cx_name', 'mapped_agent_phone', 'agent_name', 'Date', 'status', 'sent_at'];
@@ -221,6 +221,48 @@ async function ensureHeaders() {
   if (!a.length) await sh.batchWrite([{ range: `${AGENTS}!A1:D1`, values: [AGENT_HEADER] }]);
 }
 
+// ------------------------------ activity (for Dashboard + admin page) ------------------------------
+// Today's opens / link deliveries / last activity and this month's sends, per agent, kept in
+// memory. Seeded once at startup from the Clicks tab (+ unflushed WAL events), then updated
+// on every logClick — so the dashboards never have to re-read the whole Clicks tab.
+const ACT = { day: '', month: '', today: new Map(), mtd: new Map(), last: new Map() };
+
+function noteEvent(row) {
+  const [ts, ev, ag, , , , ref] = row;
+  const p = normPhone(ag);
+  if (!p) return;
+  const full = typeof ts === 'number' ? serialToStr(ts) : String(ts || '').slice(0, 16);
+  const d = full.slice(0, 10), td = today();
+  if (ACT.day !== td) { ACT.day = td; ACT.today = new Map(); }
+  if (ACT.month !== td.slice(0, 7)) { ACT.month = td.slice(0, 7); ACT.mtd = new Map(); }
+  if (full > (ACT.last.get(p) || '')) ACT.last.set(p, full);
+  if (ev === 'SEND_CLICK' && d.slice(0, 7) === ACT.month && d <= td) ACT.mtd.set(p, (ACT.mtd.get(p) || 0) + 1);
+  if (d !== td) return;
+  if (!ACT.today.has(p)) ACT.today.set(p, { opens: 0, via: new Set(), fail: '' });
+  const x = ACT.today.get(p);
+  if (ev === 'APP_OPEN') x.opens++;
+  if (ev === 'LINK_SENT') x.via.add(String(ref || '').replace(/^'/, '').startsWith('email') ? 'Email' : 'WhatsApp');
+  if (ev === 'LINK_FAIL') x.fail = String(ref || '').replace(/^'/, '');
+}
+
+async function loadActivity() {
+  try {
+    const rows = await sh.read(`${CLICKS}!A2:G`);
+    rows.forEach(noteEvent);
+    Q.clicks.forEach(noteEvent);   // replayed from the volume, not in the sheet yet
+  } catch (e) { console.warn('[store] Clicks read failed, activity starts empty:', e.message); }
+}
+
+function activity(p) {
+  const td = today();
+  if (ACT.day !== td) { ACT.day = td; ACT.today = new Map(); }
+  if (ACT.month !== td.slice(0, 7)) { ACT.month = td.slice(0, 7); ACT.mtd = new Map(); }
+  const x = ACT.today.get(p) || { opens: 0, via: new Set(), fail: '' };
+  const via = [...x.via].sort().reverse().join(' + ');
+  const mtd = Math.max(ACT.mtd.get(p) || 0, sentToday(p));   // never below today's sends
+  return { opens: x.opens, linkVia: via, linkFail: via ? '' : x.fail, sentMtd: mtd, last: ACT.last.get(p) || '' };
+}
+
 async function init() {
   wal.load(Q);
   await sh.ensureTabs([LEADS, CLICKS, ARCHIVE, TPL, AGENTS, 'Dashboard', 'AgentLinks']);
@@ -229,6 +271,7 @@ async function init() {
   const n = await loadLeads();
   await loadTemplate();
   await loadAgents();
+  await loadActivity();
   S.ready = true;
   console.log(`[store] ready — ${n} leads, ${S.byAgent.size} agents, ${S.recentCx.size} recent customers`);
 }
@@ -256,6 +299,7 @@ function logClick(event, agentPhone, name, cxPhone = '', cxName = '', ref = '') 
   ];
   Q.clicks.push(row);
   wal.append({ t: 'click', row });
+  noteEvent(row);
 }
 
 function setStatus(lead, status) {
@@ -429,6 +473,6 @@ function stats() {
 
 module.exports = {
   init, reload, flush, archive, buildQueue, agentSummaries, markSend, logClick, stats,
-  ready: () => S.ready, agentName, agentContact, syncAgentsTab: () => serial(syncAgentsTab),
+  ready: () => S.ready, agentName, agentContact, activity, syncAgentsTab: () => serial(syncAgentsTab),
   _leadId: leadId,
 };

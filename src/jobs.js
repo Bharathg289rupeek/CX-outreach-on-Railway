@@ -3,7 +3,7 @@ const sh = require('./sheets');
 const store = require('./store');
 const wal = require('./wal');
 const mailer = require('./mailer');
-const { today, nowStr, normPhone, dstr, serialToStr, cleanParam, sleep, sign } = require('./util');
+const { today, nowStr, normPhone, cleanParam, sleep, sign } = require('./util');
 
 const agentLink = (p) => `${cfg.APP_URL}/?agent=${sign(p)}`;
 
@@ -38,19 +38,24 @@ async function pool(items, size, fn) {
 
 // ------------------------------ link delivery ------------------------------
 // Channel per agent comes from the Agents tab (WHATSAPP / EMAIL / BOTH / NONE),
-// blank → DEFAULT_CHANNEL. EMAIL without an address falls back to WhatsApp.
+// blank → DEFAULT_CHANNEL. From the Agents tab, EMAIL without an address falls back to
+// WhatsApp (so the agent still gets the link). An explicit override (admin page / API)
+// does exactly what was asked: email with no address is reported as a failure.
 function channelsFor(phone, override) {
   const c = store.agentContact(phone);
   const ch = String(override || c.channel || 'WHATSAPP').toUpperCase();
   if (ch === 'NONE') return { list: [], email: c.email };
   const list = [];
   if (ch === 'WHATSAPP' || ch === 'BOTH') list.push('whatsapp');
-  if (ch === 'EMAIL' || ch === 'BOTH') list.push(c.email ? 'email' : 'whatsapp');
-  return { list: [...new Set(list)], email: c.email, fellBack: (ch === 'EMAIL' || ch === 'BOTH') && !c.email };
+  if (ch === 'EMAIL' || ch === 'BOTH') list.push(c.email || override ? 'email' : 'whatsapp');
+  return { list: [...new Set(list)], email: c.email, fellBack: !override && (ch === 'EMAIL' || ch === 'BOTH') && !c.email };
 }
 
 async function deliver(a, via, email) {
-  if (via === 'email') return mailer.sendLinkEmail(email, a, agentLink(a.phone));
+  if (via === 'email') {
+    if (!email) return { ok: false, err: 'no email for this agent in the Agents tab' };
+    return mailer.sendLinkEmail(email, a, agentLink(a.phone));
+  }
   if (!cfg.GUPSHUP_API_KEY || !cfg.TEMPLATE_ID) return { ok: false, err: 'GUPSHUP_API_KEY / TEMPLATE_ID not set' };
   return gupshupSend(a.phone, a.name);
 }
@@ -120,27 +125,11 @@ async function writeAgentLinks() {
 
 // ------------------------------ Dashboard tab ------------------------------
 async function refreshDashboard() {
-  const td = today();
-  const monthStart = td.slice(0, 7) + '-01';
-  const clicks = await sh.read('Clicks!A2:G');
-  const meta = {};
-  const m = (p) => (meta[p] = meta[p] || { opens: 0, via: new Set(), linkFail: false, sentMtd: 0, last: '' });
-
-  clicks.forEach(([ts, ev, ag, , , , ref]) => {
-    const p = normPhone(ag); if (!p) return;
-    const d = dstr(ts), x = m(p);
-    if (ev === 'APP_OPEN' && d === td) x.opens++;
-    if (ev === 'LINK_SENT' && d === td) x.via.add(String(ref || '').startsWith('email') ? 'Email' : 'WhatsApp');
-    if (ev === 'LINK_FAIL' && d === td) x.linkFail = true;
-    if (ev === 'SEND_CLICK' && d >= monthStart && d <= td) x.sentMtd++;
-    const full = typeof ts === 'number' ? serialToStr(ts) : String(ts || '').slice(0, 16);
-    if (full > x.last) x.last = full;
-  });
-
+  const monthStart = today().slice(0, 7) + '-01';
   const rows = store.agentSummaries().map((a) => {
-    const x = meta[a.phone] || m(a.phone);
+    const x = store.activity(a.phone);
     return ["'" + a.phone, a.name, a.todayCount, a.overdueCount, a.sentToday, x.sentMtd, a.remaining,
-      x.via.size ? [...x.via].sort().reverse().join(' + ') : (x.linkFail ? 'FAILED' : 'No'), x.opens, x.last];
+      x.linkVia || (x.linkFail ? 'FAILED' : 'No'), x.opens, x.last];
   });
   const header = ['agent_phone', 'agent_name', 'fresh_today', 'overdue_pending', 'sent_today', 'sent_mtd',
     'remaining_today', 'link_sent_today', 'app_opens_today', 'last_activity'];
@@ -152,4 +141,42 @@ async function refreshDashboard() {
   return `${rows.length} agents on dashboard`;
 }
 
-module.exports = { sendAgentLinks, testSend, writeAgentLinks, refreshDashboard, agentLink };
+// Everything the admin page shows, from memory (no sheet reads)
+function overview() {
+  const agents = store.agentSummaries().map((a) => {
+    const c = store.agentContact(a.phone), x = store.activity(a.phone);
+    return { ...a, email: c.email, channel: c.channel, link: agentLink(a.phone), ...x };
+  });
+  const sum = (k) => agents.reduce((n, a) => n + (a[k] || 0), 0);
+  const withLeads = agents.filter((a) => a.todayCount + a.overdueCount > 0);
+  return {
+    date: today(), now: nowStr(), cap: cfg.DAILY_CAP,
+    totals: {
+      agents: agents.length, agentsWithLeads: withLeads.length,
+      leadsToday: sum('todayCount'), overdue: sum('overdueCount'), sentToday: sum('sentToday'), sentMtd: sum('sentMtd'),
+      linksSent: agents.filter((a) => a.linkVia).length, linkFails: agents.filter((a) => a.linkFail).length,
+      opened: agents.filter((a) => a.opens > 0).length,
+    },
+    channels: { whatsapp: !!(cfg.GUPSHUP_API_KEY && cfg.TEMPLATE_ID), email: mailer.emailEnabled() },
+    blast: { enabled: cfg.BLAST_ENABLED, lastDay: wal.getMeta('blastDay') || '', ranToday: wal.getMeta('blastDay') === today() },
+    system: store.stats(),
+    agents,
+  };
+}
+
+// Send links to a chosen set of agents (admin page). channel: whatsapp | email | both | '' (= Agents tab)
+async function sendLinks(phones, { channel, email } = {}) {
+  const want = new Set((phones || []).map(normPhone).filter(Boolean));
+  const list = store.agentSummaries().filter((a) => want.has(a.phone));
+  [...want].filter((p) => !list.some((a) => a.phone === p))
+    .forEach((p) => list.push({ phone: p, name: store.agentName(p), todayCount: 0, overdueCount: 0 }));
+  const results = [];
+  await pool(list, 5, async (a) => {
+    const res = await sendLinkTo(a, { channel, email });
+    if (!res.length) results.push({ phone: a.phone, name: a.name, via: '-', ok: false, err: 'channel is NONE' });
+    res.forEach((r) => results.push({ phone: a.phone, name: a.name, via: r.via, to: r.to, ok: r.ok, err: r.err || '' }));
+  });
+  return { sent: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results };
+}
+
+module.exports = { sendAgentLinks, testSend, sendLinks, writeAgentLinks, refreshDashboard, overview, agentLink };
