@@ -38,11 +38,13 @@ ${body}</body></html>`;
 }
 
 function renderApp(agent, data) {
+  // No number entry: agents only ever arrive through the personal link sent to them,
+  // and typing a number would let anyone open another agent's customer list.
   if (!agent) {
-    return page('Login', `<div class="wrap"><div class="info">
-<p>Enter your WhatsApp number:</p><input id="aid" type="tel" placeholder="98XXXXXXXX"><br><br>
-<button class="btn wa" onclick="var v=document.getElementById('aid').value.replace(/\\D/g,'');if(v)location.href='/?agent='+v">Continue</button>
-</div></div>`);
+    return page('Open your link', `<div class="info">
+<div class="icon">📲</div><h3>Open your personal link</h3>
+<p>Please open this app using the link sent to you on WhatsApp.</p>
+</div>`);
   }
   return page('Loading…', `
 <div id="banner" class="banner"></div>

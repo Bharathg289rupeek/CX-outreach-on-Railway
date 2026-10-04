@@ -96,10 +96,12 @@ const run = (fn) => async (req, res) => {
 app.get('/admin/stats',     admin, run(() => store.stats()));
 app.post('/admin/flush',    admin, run(() => store.flush()));
 app.post('/admin/reload',   admin, run(() => store.reload()));
-app.post('/admin/reports',  admin, run(async () => `${await jobs.refreshDashboard()} · ${await jobs.writeAgentLinks()}`));
+const reportsJob = async () => `${await store.syncAgentsTab()} · ${await jobs.refreshDashboard()} · ${await jobs.writeAgentLinks()}`;
+app.post('/admin/reports',  admin, run(reportsJob));
 app.post('/admin/archive',  admin, run(() => store.archive()));
 app.post('/admin/blast',    admin, run((req) => jobs.sendAgentLinks(req.query.force === '1')));
-app.post('/admin/test-send', admin, run((req) => jobs.testSend(normPhone(req.query.phone))));
+app.post('/admin/test-send', admin, run((req) => jobs.testSend(normPhone(req.query.phone), { channel: req.query.channel, email: req.query.email })));
+app.post('/admin/send-link',  admin, run((req) => jobs.testSend(normPhone(req.query.phone), { channel: req.query.channel, email: req.query.email })));
 
 app.use((err, req, res, next) => {
   console.error(err);
@@ -124,7 +126,7 @@ async function boot() {
   // Run crons on exactly ONE instance (Railway replicas = 1)
   if (cfg.RUN_CRONS) {
     const opt = { timezone: cfg.TZ };
-    const reports = safe('reports', async () => `${await jobs.refreshDashboard()} · ${await jobs.writeAgentLinks()}`);
+    const reports = safe('reports', reportsJob);
     setInterval(reports, cfg.REPORT_MIN * 60000);
     cron.schedule('0 3 * * *', safe('archive', () => store.archive()), opt);
     cron.schedule('30 9 * * *', safe('blast', () => jobs.sendAgentLinks()), opt);

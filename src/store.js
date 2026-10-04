@@ -29,9 +29,11 @@ const sh = require('./sheets');
 const wal = require('./wal');
 const { normPhone, today, nowStr, dstr, isDate, daysBetween } = require('./util');
 
-const LEADS = 'Leads', CLICKS = 'Clicks', ARCHIVE = 'Archive', TPL = 'MsgTemplate';
+const LEADS = 'Leads', CLICKS = 'Clicks', ARCHIVE = 'Archive', TPL = 'MsgTemplate', AGENTS = 'Agents';
 const LEAD_HEADER = ['cx_phone', 'cx_name', 'mapped_agent_phone', 'agent_name', 'Date', 'status', 'sent_at'];
 const CLICK_HEADER = ['timestamp', 'event', 'agent_phone', 'agent_name', 'cx_phone', 'cx_name', 'ref'];
+const AGENT_HEADER = ['agent_phone', 'agent_name', 'email', 'link_channel (WHATSAPP / EMAIL / BOTH / NONE)'];
+const CHANNELS = ['WHATSAPP', 'EMAIL', 'BOTH', 'NONE'];
 
 const DEFAULT_TPL =
 `Hi {{cx_name}}, this is {{agent_name}} from Rupeek Gold Loan.
@@ -49,6 +51,7 @@ const S = {
   leads: new Map(),      // id → lead
   byAgent: new Map(),    // agent phone → [id]
   agentNames: new Map(), // agent phone → name
+  agentInfo: new Map(),  // agent phone → { name, email, channel } from the Agents tab
   recentCx: new Map(),   // cx phone → last SENT date (yyyy-MM-dd), for dedupe
   sentCount: new Map(),  // agent phone → sends today
   sentTs: new Map(),     // id → ms of the send (this process only; for the re-open grace window)
@@ -75,6 +78,23 @@ function leadId(cx, agent, date) {
   return crypto.createHash('sha1').update(`${cx}|${agent}|${date}`).digest('hex').slice(0, 16);
 }
 const rowId = (r) => leadId(normPhone(r[0]), normPhone(r[2]), dstr(r[4]) || String(r[4] == null ? '' : r[4]).trim());
+
+function agentName(p) { return S.agentNames.get(p) || (S.agentInfo.get(p) || {}).name || ''; }
+
+// How this agent gets the daily link: { channel, email }
+function agentContact(p) {
+  const i = S.agentInfo.get(p) || {};
+  return { email: i.email || '', channel: i.channel || cfg.DEFAULT_CHANNEL };
+}
+
+// Add agents seen in Leads but missing from the Agents tab, so ops only fill email / channel
+async function syncAgentsTab() {
+  const missing = [...S.byAgent.keys()].filter((p) => !S.agentInfo.has(p)).sort();
+  if (!missing.length) return '0 new agents';
+  await sh.append(`${AGENTS}!A:D`, missing.map((p) => ["'" + p, agentName(p), '', '']));
+  missing.forEach((p) => S.agentInfo.set(p, { name: agentName(p), email: '', channel: '' }));
+  return `${missing.length} new agents added to ${AGENTS}`;
+}
 
 function sentToday(agent) {
   const td = today();
@@ -162,6 +182,22 @@ async function loadTemplate() {
   } catch (e) { console.warn('[store] template read failed, keeping previous:', e.message); }
 }
 
+// Agents tab: how each agent gets their daily link. Blank channel → DEFAULT_CHANNEL.
+async function loadAgents() {
+  try {
+    const rows = await sh.read(`${AGENTS}!A2:D`, { valueRenderOption: 'FORMATTED_VALUE' });
+    const m = new Map();
+    rows.forEach((r) => {
+      const p = normPhone(r[0]);
+      if (!p) return;
+      let ch = String(r[3] || '').trim().toUpperCase().replace(/[^A-Z]/g, '');
+      if (ch === 'WA') ch = 'WHATSAPP';
+      m.set(p, { name: String(r[1] || '').trim(), email: String(r[2] || '').trim(), channel: CHANNELS.includes(ch) ? ch : '' });
+    });
+    S.agentInfo = m;
+  } catch (e) { console.warn('[store] Agents tab read failed, keeping previous:', e.message); }
+}
+
 // Archive history for customer-level dedupe (startup only; archive can be big)
 async function loadArchiveDedupe() {
   if (!cfg.DEDUPE_DAYS) return;
@@ -181,15 +217,18 @@ async function ensureHeaders() {
   if (!c.length) await sh.batchWrite([{ range: `${CLICKS}!A1:G1`, values: [CLICK_HEADER] }]);
   const t = await sh.read(`${TPL}!A1:A2`);
   if (!t.length) await sh.batchWrite([{ range: `${TPL}!A1:A2`, values: [['CX message template — edit A2. Placeholders: {{cx_name}}, {{agent_name}}'], [DEFAULT_TPL]] }]);
+  const a = await sh.read(`${AGENTS}!A1:D1`);
+  if (!a.length) await sh.batchWrite([{ range: `${AGENTS}!A1:D1`, values: [AGENT_HEADER] }]);
 }
 
 async function init() {
   wal.load(Q);
-  await sh.ensureTabs([LEADS, CLICKS, ARCHIVE, TPL, 'Dashboard', 'AgentLinks']);
+  await sh.ensureTabs([LEADS, CLICKS, ARCHIVE, TPL, AGENTS, 'Dashboard', 'AgentLinks']);
   await ensureHeaders();
   await loadArchiveDedupe();
   const n = await loadLeads();
   await loadTemplate();
+  await loadAgents();
   S.ready = true;
   console.log(`[store] ready — ${n} leads, ${S.byAgent.size} agents, ${S.recentCx.size} recent customers`);
 }
@@ -199,17 +238,18 @@ function reload() {
   return serial(async () => {
     const n = await loadLeads();
     await loadTemplate();
+    await loadAgents();
     return `${n} leads, ${S.byAgent.size} agents`;
   });
 }
 
 // ------------------------------ write-behind ------------------------------
-function logClick(event, agentPhone, agentName, cxPhone = '', cxName = '', ref = '') {
+function logClick(event, agentPhone, name, cxPhone = '', cxName = '', ref = '') {
   if (Q.clicks.length >= MAX_QUEUED_CLICKS) Q.clicks.shift();
   const row = [
     nowStr(), event,
     agentPhone ? "'" + agentPhone : '',
-    agentName || S.agentNames.get(agentPhone) || '',
+    name || agentName(agentPhone) || '',
     cxPhone ? "'" + cxPhone : '',
     cxName || '',
     ref ? "'" + String(ref) : '',
@@ -275,7 +315,7 @@ async function doFlush() {
 function renderMsg(lead) {
   return S.template
     .replace(/\{\{\s*cx_name\s*\}\}/g, lead.cxName || 'Customer')
-    .replace(/\{\{\s*agent_name\s*\}\}/g, S.agentNames.get(lead.agentPhone) || 'Rupeek');
+    .replace(/\{\{\s*agent_name\s*\}\}/g, agentName(lead.agentPhone) || 'Rupeek');
 }
 const waLink = (lead) => 'https://wa.me/' + lead.cxPhone + '?text=' + encodeURIComponent(renderMsg(lead));
 
@@ -293,7 +333,7 @@ function buildQueue(agent) {
   overdue.sort((a, b) => (a.origDate < b.origDate ? -1 : a.origDate > b.origDate ? 1 : 0));
   const sent = sentToday(agent);
   return {
-    agentName: S.agentNames.get(agent) || '',
+    agentName: agentName(agent),
     sentToday: sent, remaining: Math.max(0, cfg.DAILY_CAP - sent), cap: cfg.DAILY_CAP,
     today: todayL, overdue, todayCount: todayL.length, overdueCount: overdue.length, date: td,
   };
@@ -389,6 +429,6 @@ function stats() {
 
 module.exports = {
   init, reload, flush, archive, buildQueue, agentSummaries, markSend, logClick, stats,
-  ready: () => S.ready, agentName: (p) => S.agentNames.get(p) || '',
+  ready: () => S.ready, agentName, agentContact, syncAgentsTab: () => serial(syncAgentsTab),
   _leadId: leadId,
 };
