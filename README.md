@@ -48,7 +48,15 @@ The `Agents` tab decides how each agent gets their daily link. Railway adds ever
 * The email has the same content as the old Apps Script email (target, today's leads, overdue, button), so `Emaillink` and that script can be retired.
 * `Dashboard` → `link_sent_today` shows `WhatsApp`, `Email`, `WhatsApp + Email`, `FAILED` or `No`. Failures carry the reason in `Clicks` (`LINK_FAIL`, column G).
 
-**Email setup:** set `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` in Railway. For Google Workspace: turn on 2-step verification for the sending mailbox, create an **App Password** (Google Account → Security → App passwords), and use `smtp.gmail.com` / `587`. If Rupeek IT blocks App Passwords, any SMTP provider (SendGrid, AWS SES) works with the same variables.
+**Email setup (Railway):** Railway blocks outgoing SMTP on non-Pro plans (you get `Connection timeout`), so send through the HTTPS relay:
+1. script.google.com → New project → paste `apps-script/mail-relay.gs`.
+2. Project Settings → Script Properties → `RELAY_SECRET` = a long random string.
+3. Deploy → New deployment → Web app → Execute as **Me**, Who has access **Anyone** → copy the `/exec` URL.
+4. Railway: `MAIL_RELAY_URL` = that URL, `MAIL_RELAY_SECRET` = the same secret. Optional `MAIL_FROM=Rupeek CX Team <…>` sets the sender name.
+
+Mail goes out from the Google account that deployed the relay (Workspace quota: 1,500 recipients/day).
+
+**Or SMTP** (Railway Pro or another host): set `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM` in Railway. For Google Workspace: turn on 2-step verification for the sending mailbox, create an **App Password** (Google Account → Security → App passwords), and use `smtp.gmail.com` / `587`. If Rupeek IT blocks App Passwords, any SMTP provider (SendGrid, AWS SES) works with the same variables.
 
 > Run **exactly one** Railway replica. State lives in that one process.
 

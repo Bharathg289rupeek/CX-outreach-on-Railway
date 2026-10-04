@@ -1,6 +1,9 @@
 /******************************************************************
- * Agent link by email (SMTP). Works with Gmail / Google Workspace
- * (smtp.gmail.com + an App Password), SendGrid, AWS SES, etc.
+ * Agent link by email. Two transports:
+ *  - MAIL_RELAY_URL (preferred on Railway): HTTPS POST to the Apps Script
+ *    relay (apps-script/mail-relay.gs), which sends via MailApp from your
+ *    Google account. Railway blocks outgoing SMTP on non-Pro plans.
+ *  - SMTP_* : Gmail / Workspace App Password, SendGrid, AWS SES, etc.
  * Same content as the old Apps Script "CX Outreach Daily Email".
  ******************************************************************/
 const nodemailer = require('nodemailer');
@@ -18,7 +21,9 @@ function transport() {
   return _t;
 }
 
-const emailEnabled = () => !!(cfg.SMTP_HOST && cfg.SMTP_USER && cfg.SMTP_PASS);
+const relayEnabled = () => !!(cfg.MAIL_RELAY_URL && cfg.MAIL_RELAY_SECRET);
+const smtpEnabled = () => !!(cfg.SMTP_HOST && cfg.SMTP_USER && cfg.SMTP_PASS);
+const emailEnabled = () => relayEnabled() || smtpEnabled();
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 function dateLabel() {
@@ -47,8 +52,26 @@ function buildEmail(a, link) {
   return { subject: `CX Outreach : Today CX List — ${dateLabel()}`, html, text };
 }
 
+async function sendViaRelay(to, m) {
+  const fromName = (String(cfg.MAIL_FROM).match(/^\s*"?([^"<]+?)"?\s*</) || [])[1] || 'Rupeek CX Team';
+  try {
+    // Apps Script answers a POST with a 302 to the result; fetch follows it with a GET
+    const r = await fetch(cfg.MAIL_RELAY_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'follow',
+      body: JSON.stringify({ secret: cfg.MAIL_RELAY_SECRET, to, fromName, ...m }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await r.text();
+    let j = null; try { j = JSON.parse(text); } catch (e) { /* HTML = sign-in page / wrong access setting */ }
+    if (j && j.ok) return { ok: true, body: `relay, quota left ${j.quotaLeft}` };
+    if (j) return { ok: false, err: 'relay: ' + j.err };
+    return { ok: false, err: `relay returned HTTP ${r.status} non-JSON — set the web app's "Who has access" to Anyone and redeploy` };
+  } catch (e) { return { ok: false, err: 'relay: ' + String(e.message || e).slice(0, 250) }; }
+}
+
 async function sendLinkEmail(to, a, link) {
-  if (!emailEnabled()) return { ok: false, err: 'email not configured (SMTP_HOST / SMTP_USER / SMTP_PASS)' };
+  if (!emailEnabled()) return { ok: false, err: 'email not configured (MAIL_RELAY_URL + MAIL_RELAY_SECRET, or SMTP_HOST / SMTP_USER / SMTP_PASS)' };
+  if (relayEnabled()) return sendViaRelay(to, buildEmail(a, link));
   try {
     const m = buildEmail(a, link);
     const info = await transport().sendMail({ from: cfg.MAIL_FROM || cfg.SMTP_USER, to, ...m });
